@@ -1,0 +1,50 @@
+name: counterpart-tip infra recovery system
+on: { pull_request: {}, push: { branches: [main] }, workflow_dispatch: {} }
+permissions: { contents: read }
+jobs:
+  current-production-infra:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env: { GH_TOKEN: "${{ secrets.TEST_FLEET_GITHUB_TOKEN || github.token }}" }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: { persist-credentials: false }
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e
+        with: { terraform_version: 1.16.2, terraform_wrapper: false }
+      - name: Test 1 - clone canonical current production infra tip exactly
+        shell: bash
+        run: |
+          set -euo pipefail
+          p="${GITHUB_REPOSITORY_OWNER%-test}"; r=sonus-auris-infra
+          if ! gh api "repos/$p/$r" >/tmp/infra.json 2>/dev/null; then
+            echo "Canonical private infra $p/$r is not visible to this workflow." >&2
+            echo "Configure TEST_FLEET_GITHUB_TOKEN with read access to the production org. A public-only token must not silently substitute sonus-auris.infra or another repo." >&2
+            exit 1
+          fi
+          b="$(jq -r .default_branch /tmp/infra.json)"; s="$(gh api "repos/$p/$r/commits/$b" --jq .sha)"; [[ "$s" =~ ^[0-9a-f]{40}$ ]]
+          gh repo clone "$p/$r" .deps/infra -- --depth=1 --branch "$b"
+          test "$(git -C .deps/infra rev-parse HEAD)" = "$s"
+          echo "$p/$r@$s"
+      - name: Test 2 - declared Terraform layout and state boundaries are coherent
+        shell: bash
+        run: |
+          set -euo pipefail; root=.deps/infra
+          tf="$(find "$root" -path "$root/.git" -prune -o -type f -name '*.tf' -print | head -n1 || true)"
+          if [[ -f "$root/.ores-infra.toml" ]]; then
+            grep -Eq '^layout[[:space:]]*=[[:space:]]*"modules"' "$root/.ores-infra.toml" || { echo "layout must be modules" >&2; exit 1; }
+            grep -Eq '^modules_root[[:space:]]*=[[:space:]]*"modules"' "$root/.ores-infra.toml" || { echo "modules_root must be modules" >&2; exit 1; }
+            grep -Eq '^environments_root[[:space:]]*=[[:space:]]*"environments"' "$root/.ores-infra.toml" || { echo "environments_root must be environments" >&2; exit 1; }
+            for e in preview staging production; do test -d "$root/environments/$e" || { echo "missing environments/$e" >&2; exit 1; }; done
+          elif [[ -n "$tf" ]]; then
+            test -d "$root/modules" || { echo "Terraform repo is missing modules/" >&2; exit 1; }
+            test -d "$root/environments" || { echo "Terraform repo is missing environments/" >&2; exit 1; }
+          else
+            echo "No Terraform detected; Terraform-only layout assertions skipped."
+          fi
+          bad="$(find "$root" -path "$root/.git" -prune -o -type f \( -name 'terraform.tfstate' -o -name 'terraform.tfstate.backup' -o -name '*.pem' -o -name '*.key' \) -print | head -n20 || true)"; test -z "$bad" || { printf 'Forbidden tracked state/key material:\n%s\n' "$bad" >&2; exit 1; }
+      - name: Test 3 - Terraform current-tip environments initialize and validate
+        shell: bash
+        run: |
+          set -euo pipefail; root=.deps/infra; validated=0
+          for e in preview staging production; do d="$root/environments/$e"; if compgen -G "$d/*.tf" >/dev/null; then terraform -chdir="$d" fmt -check -recursive; terraform -chdir="$d" init -backend=false -input=false; terraform -chdir="$d" validate -no-color; validated=$((validated+1)); fi; done
+          if [[ "$validated" -eq 0 ]]; then if find "$root" -path "$root/.git" -prune -o -name '*.tf' -print -quit | grep -q .; then terraform fmt -check -recursive "$root"; else echo "No Terraform roots; exact checkout and state-boundary assertions still ran."; fi; fi
